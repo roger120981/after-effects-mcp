@@ -238,6 +238,17 @@ Parameters: `code` (a function body; use `return` to send a value back) and opti
 
 After Effects must have **Preferences > Scripting & Expressions > "Allow Scripts to Write Files and Access Network"** enabled, and the "MCP Bridge Auto" panel open with Auto-run on.
 
+Every bridge command runs between `app.beginSuppressDialogs()` and `app.endSuppressDialogs(false)`, so warning dialogs cannot freeze the bridge. Closing the "MCP Bridge Auto" panel no longer stops command processing: polling continues with auto-run treated as ON.
+
+## Asynchronous rendering (aerender)
+
+`app.project.renderQueue.render()` blocks the After Effects UI thread, so the bridge cannot answer while it runs. For long renders use the `render-comp` and `render-status` tools, which run `aerender` as a separate process (no shell). Both are gated by `AE_MCP_ALLOW_SCRIPTS=1`.
+
+- `render-comp`: `projectPath`, `compName`, `outputPath`, optional `renderSettingsTemplate` and `outputModuleTemplate`. Returns a `jobId`. **Save the project first**: aerender renders the `.aep` file on disk, not the unsaved state in the open AE session.
+- `render-status`: `jobId`. Returns `state` (`running`, `done`, `error`), `exitCode`, `framesRendered`, `lastLine`, `elapsedSeconds`, `outputPath` and the last ~20 log lines.
+- aerender is auto-detected under `C:\Program Files\Adobe\Adobe After Effects <2021-2026>\Support Files\aerender.exe` (Windows) or `/Applications/Adobe After Effects <year>/aerender` (macOS). Set `AE_RENDER_EXE` to override.
+- Jobs are kept in memory only; they are lost when the server restarts.
+
 ## Bridge folder location
 
 The server and the After Effects panel exchange `ae_command.json` / `ae_mcp_result.json` through a shared folder. Resolution order (the same on both sides):

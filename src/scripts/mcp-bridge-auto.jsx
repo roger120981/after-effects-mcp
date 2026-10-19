@@ -1316,6 +1316,7 @@ autoRunCheckbox.value = true;
 // Check interval (ms)
 var checkInterval = 2000;
 var isChecking = false;
+var paletteClosed = false;
 
 // Bridge folder: AE_MCP_BRIDGE_DIR env override; else %APPDATA%\\ae-mcp-bridge on Windows
 // (Folder.userData, local and not OneDrive-synced); else Documents/ae-mcp-bridge
@@ -1544,11 +1545,30 @@ function getLayerInfo() {
 
 // Execute command
 function executeCommand(command, args, commandId) {
+    var suppressed = false;
+    try {
+        if (typeof app.beginSuppressDialogs === "function") {
+            app.beginSuppressDialogs();
+            suppressed = true;
+        }
+    } catch (e1) {}
+    try {
+        executeCommandInner(command, args, commandId);
+    } finally {
+        try {
+            if (suppressed && typeof app.endSuppressDialogs === "function") {
+                app.endSuppressDialogs(false);
+            }
+        } catch (e2) {}
+    }
+}
+
+function executeCommandInner(command, args, commandId) {
     var result = "";
 
     logToPanel("Executing command: " + command);
-    statusText.text = "Running: " + command;
-    panel.update();
+    setStatus("Running: " + command);
+    refreshPanel();
 
     try {
         logToPanel("Attempting to execute: " + command); // Log before switch
@@ -1693,7 +1713,7 @@ function executeCommand(command, args, commandId) {
         logToPanel("Result file write process complete.");
         
         logToPanel("Command completed successfully: " + command); // Changed log message
-        statusText.text = "Command completed: " + command;
+        setStatus("Command completed: " + command);
         
         // Update command file status
         logToPanel("Updating command status to completed...");
@@ -1703,7 +1723,7 @@ function executeCommand(command, args, commandId) {
     } catch (error) {
         var errorMsg = "ERROR in executeCommand for '" + command + "': " + error.toString() + (error.line ? " (line: " + error.line + ")" : "");
         logToPanel(errorMsg); // Log detailed error
-        statusText.text = "Error: " + error.toString();
+        setStatus("Error: " + error.toString());
         
         // Write detailed error to result file
         try {
@@ -1763,13 +1783,31 @@ function updateCommandStatus(status) {
 
 // Log message to panel
 function logToPanel(message) {
-    var timestamp = new Date().toLocaleTimeString();
-    logText.text = timestamp + ": " + message + "\n" + logText.text;
+    try {
+        var timestamp = new Date().toLocaleTimeString();
+        logText.text = timestamp + ": " + message + "\n" + logText.text;
+    } catch (e) {
+        // Palette closed: UI elements are gone, nothing to log to.
+    }
+}
+
+// UI helpers that never throw (the palette may have been closed).
+function setStatus(text) {
+    try { statusText.text = text; } catch (e) {}
+}
+
+function refreshPanel() {
+    try { panel.update(); } catch (e) {}
+}
+
+// Auto-run is treated as ON when the checkbox is unavailable (palette closed).
+function isAutoRunEnabled() {
+    try { return autoRunCheckbox.value ? true : false; } catch (e) { return true; }
 }
 
 // Check for new commands
 function checkForCommands() {
-    if (!autoRunCheckbox.value || isChecking) return;
+    if (isChecking || !isAutoRunEnabled()) return;
     
     isChecking = true;
     
@@ -1797,9 +1835,9 @@ function checkForCommands() {
         }
     } catch (e) {
         logToPanel("Error checking for commands: " + e.toString());
+    } finally {
+        isChecking = false;
     }
-    
-    isChecking = false;
 }
 
 // Set up timer to check for commands
@@ -1814,10 +1852,16 @@ checkButton.onClick = function() {
     checkForCommands();
 };
 
+// Closing the palette must NOT stop command processing: the scheduled task keeps
+// running (UI access is guarded, auto-run is treated as ON). The window is just hidden.
+panel.onClose = function() {
+    paletteClosed = true;
+};
+
 // Log startup
 logToPanel("MCP Bridge Auto started");
 logToPanel("Command file: " + getCommandFilePath());
-statusText.text = "Ready - Auto-run is " + (autoRunCheckbox.value ? "ON" : "OFF");
+setStatus("Ready - Auto-run is " + (autoRunCheckbox.value ? "ON" : "OFF"));
 
 // Start the command checker
 startCommandChecker();

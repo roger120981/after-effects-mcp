@@ -13,6 +13,13 @@ import {
   waitForCommandResult,
   cancelPendingCommand,
 } from "./bridge-protocol.js";
+import { spawn } from "child_process";
+import { randomUUID } from "crypto";
+import {
+  resolveAerenderPath,
+  buildAerenderArgs,
+  JobRegistry,
+} from "./render-jobs.js";
 
 // Create an MCP server
 const server = new McpServer({
@@ -376,6 +383,74 @@ server.tool(
   }
 );
 
+// Asynchronous rendering through aerender (does not block the AE UI thread)
+const renderJobs = new JobRegistry();
+
+server.tool(
+  "render-comp",
+  "Start an asynchronous render of a composition with aerender.exe and return a jobId. The project must be saved first (aerender renders the saved .aep file). Poll with render-status. Disabled unless AE_MCP_ALLOW_SCRIPTS=1 is set for the server.",
+  {
+    projectPath: z.string().describe("Absolute path of the saved .aep project"),
+    compName: z.string().describe("Name of the composition to render"),
+    outputPath: z.string().describe("Absolute output file path"),
+    renderSettingsTemplate: z.string().optional().describe("Render settings template name (-RStemplate)"),
+    outputModuleTemplate: z.string().optional().describe("Output module template name (-OMtemplate)")
+  },
+  async ({ projectPath, compName, outputPath, renderSettingsTemplate, outputModuleTemplate }) => {
+    if (process.env.AE_MCP_ALLOW_SCRIPTS !== '1') {
+      return {
+        content: [{
+          type: "text",
+          text: "render-comp is disabled. It launches aerender, which executes project content. To enable it, start the MCP server with the environment variable AE_MCP_ALLOW_SCRIPTS=1 and restart the client."
+        }]
+      };
+    }
+    const aerender = resolveAerenderPath({ env: process.env, platform: process.platform, exists: fs.existsSync });
+    if (!aerender) {
+      return {
+        content: [{
+          type: "text",
+          text: "aerender was not found. Install After Effects in the default location or set AE_RENDER_EXE to the full path of aerender(.exe) for the server."
+        }]
+      };
+    }
+    let args: string[];
+    try {
+      args = buildAerenderArgs({
+        projectPath, compName, outputPath,
+        renderSettings: renderSettingsTemplate,
+        outputModule: outputModuleTemplate
+      });
+    } catch (error) {
+      return { content: [{ type: "text", text: `Invalid render-comp arguments: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
+    const jobId = randomUUID();
+    const child = spawn(aerender, args, { windowsHide: true });
+    renderJobs.createJob(jobId, child, { outputPath });
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({ jobId, aerender, args, note: "poll with render-status" }, null, 2)
+      }]
+    };
+  }
+);
+
+server.tool(
+  "render-status",
+  "Get the status of an asynchronous render started with render-comp (state, frames, elapsed time, log tail).",
+  {
+    jobId: z.string().describe("jobId returned by render-comp")
+  },
+  async ({ jobId }) => {
+    const status = renderJobs.status(jobId);
+    if (!status) {
+      return { content: [{ type: "text", text: `Unknown jobId: ${jobId} (jobs live only while the server process runs)` }] };
+    }
+    return { content: [{ type: "text", text: JSON.stringify(status, null, 2) }] };
+  }
+);
+
 // Add a tool to provide help and instructions
 server.tool(
   "get-help",
@@ -439,6 +514,10 @@ Effect Templates:
 Arbitrary ExtendScript (opt-in):
 - run-extendscript: run JavaScript inside After Effects and get its return value back in one call.
   Disabled unless the server is started with AE_MCP_ALLOW_SCRIPTS=1.
+  Every bridge command runs with After Effects dialogs suppressed.
+- render-comp / render-status: asynchronous render through aerender (same AE_MCP_ALLOW_SCRIPTS=1 gate).
+  Save the project first (aerender renders the .aep on disk); set AE_RENDER_EXE if aerender is not auto-detected.
+  render-comp returns a jobId; poll it with render-status.
   The code is a function body: use \`return\` to send a value back.
 - AE_MCP_BRIDGE_DIR overrides the bridge folder (set it for both the server and After Effects).
   By default the server and AE both use %APPDATA%\\ae-mcp-bridge on Windows (local, not OneDrive-synced) and ~/Documents/ae-mcp-bridge elsewhere.
