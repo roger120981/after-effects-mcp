@@ -310,3 +310,14 @@ test("RenderJobStore.prune removes stale orphaned .json.tmp files only", () => {
     assert.equal(existsSync(freshTmp), true);
   });
 });
+
+test("inferJobState infers done from a non-empty output file when aerender skipped its summary line", () => {
+  const tail = "PROGRESS:  0:00:14:29 (450): 0 Seconds\n";
+  const done = inferJobState({ alive: false, logTail: tail, outputBytes: 280_000_000 });
+  assert.equal(done.state, "done");
+  assert.equal(done.inferred, true);
+  assert.equal(inferJobState({ alive: false, logTail: tail, outputBytes: 0 }).state, "unknown");
+  assert.equal(inferJobState({ alive: false, logTail: tail }).state, "unknown");
+  assert.equal(inferJobState({ alive: false, logTail: "ERROR: disk full\n", outputBytes: 10 }).state, "error");
+  assert.equal(inferJobState({ alive: true, logTail: tail, outputBytes: 10 }).state, "running");
+});

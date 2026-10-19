@@ -91,12 +91,15 @@ export interface InferJobStateInput {
   exitCode?: number;
   alive: boolean;
   logTail: string;
+  /** Size of the output file when it exists (used when aerender exits without its summary line). */
+  outputBytes?: number;
 }
 
 export function inferJobState(input: InferJobStateInput): {
   state: JobState;
   framesRendered?: number;
   lastLine: string;
+  inferred?: boolean;
 } {
   const progress = parseAerenderProgress(input.logTail);
   const base = { framesRendered: progress.framesRendered, lastLine: progress.lastLine };
@@ -105,6 +108,8 @@ export function inferJobState(input: InferJobStateInput): {
   // Process gone and no exit code recorded (server restarted meanwhile): trust the log.
   if (progress.state === "error") return { ...base, state: "error" };
   if (progress.state === "done") return { ...base, state: "done" };
+  // aerender does not always print its summary when stdout is a file: a written output means it finished.
+  if ((input.outputBytes ?? 0) > 0) return { ...base, state: "done", inferred: true };
   return { ...base, state: "unknown" };
 }
 
@@ -193,6 +198,8 @@ export interface JobStatus {
   exitCode?: number;
   framesRendered?: number;
   lastLine: string;
+  /** True when "done" was deduced from the output file instead of aerender output. */
+  inferred?: boolean;
   elapsedSeconds: number;
   outputPath?: string;
   logPath: string;
@@ -302,7 +309,11 @@ export class RenderJobStore {
   statusOf(record: RenderJobRecord): JobStatus {
     const logTail = readLogTail(this.logPathFor(record.jobId), this.tailBytes);
     const alive = record.pid !== undefined && record.exitCode === undefined ? this.isAlive(record.pid) : false;
-    const inferred = inferJobState({ exitCode: record.exitCode, alive, logTail });
+    let outputBytes: number | undefined;
+    if (!alive && record.exitCode === undefined && record.outputPath) {
+      try { outputBytes = fs.statSync(record.outputPath).size; } catch { outputBytes = undefined; }
+    }
+    const inferred = inferJobState({ exitCode: record.exitCode, alive, logTail, outputBytes });
     const started = Date.parse(record.startedAt);
     const finished = record.finishedAt ? Date.parse(record.finishedAt) : undefined;
     const end = inferred.state === "running" || finished === undefined ? this.now() : finished;
@@ -313,6 +324,7 @@ export class RenderJobStore {
       exitCode: record.exitCode,
       framesRendered: inferred.framesRendered,
       lastLine: inferred.lastLine,
+      ...(inferred.inferred ? { inferred: true } : {}),
       elapsedSeconds: Math.max(0, Math.round((end - started) / 1000)),
       outputPath: record.outputPath,
       logPath: this.logPathFor(record.jobId),
