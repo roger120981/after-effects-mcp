@@ -60,7 +60,7 @@ export interface AerenderProgress {
 
 // Only lines that START with an error marker count; "ERROR:" inside a path or message does not.
 function isErrorLine(line: string): boolean {
-  return /^(aerender ERROR|ERROR:|Error:)/.test(line.trim());
+  return /^(aerender error|error:)/i.test(line.trim());
 }
 
 export function parseAerenderProgress(logText: string): AerenderProgress {
@@ -103,7 +103,8 @@ export function inferJobState(input: InferJobStateInput): {
 } {
   const progress = parseAerenderProgress(input.logTail);
   const base = { framesRendered: progress.framesRendered, lastLine: progress.lastLine };
-  if (input.exitCode !== undefined) return { ...base, state: input.exitCode === 0 ? "done" : "error" };
+  // aerender can exit 0 after printing an error (e.g. unwritable output folder): the log wins.
+  if (input.exitCode !== undefined) return { ...base, state: input.exitCode === 0 && progress.state !== "error" ? "done" : "error" };
   if (input.alive) return { ...base, state: "running" };
   // Process gone and no exit code recorded (server restarted meanwhile): trust the log.
   if (progress.state === "error") return { ...base, state: "error" };

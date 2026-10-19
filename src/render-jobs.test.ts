@@ -321,3 +321,10 @@ test("inferJobState infers done from a non-empty output file when aerender skipp
   assert.equal(inferJobState({ alive: false, logTail: "ERROR: disk full\n", outputBytes: 10 }).state, "error");
   assert.equal(inferJobState({ alive: true, logTail: tail, outputBytes: 10 }).state, "running");
 });
+
+test("an aerender error line wins over exit code 0 and is matched case-insensitively", () => {
+  const log = "aerender version 26.5x89\nPROGRESS: Adding specified comp to Render Queue\naerender Error: After Effects error: Can not create a file in directory C:\\out.\n";
+  assert.equal(parseAerenderProgress(log).state, "error");
+  assert.equal(inferJobState({ exitCode: 0, alive: false, logTail: log }).state, "error");
+  assert.equal(inferJobState({ exitCode: 0, alive: false, logTail: "PROGRESS:  Total Time Elapsed: 8 Seconds\n" }).state, "done");
+});

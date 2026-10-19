@@ -437,6 +437,8 @@ server.tool(
     try {
       store.ensureDir();
       const logPath = store.logPathFor(jobId);
+      // aerender cannot create missing output folders.
+      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
       const logFd = fs.openSync(logPath, "a");
       let child: ChildProcess;
       try {
