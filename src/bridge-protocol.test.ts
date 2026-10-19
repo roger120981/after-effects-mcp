@@ -7,6 +7,7 @@ import {
   resolveBridgeDir,
   clampTimeout,
   waitForCommandResult,
+  cancelPendingCommand,
 } from "./bridge-protocol.ts";
 
 test("createCommandId returns unique non-empty ids", () => {
@@ -140,4 +141,18 @@ test("waitForCommandResult survives read errors", async () => {
     async () => {},
   );
   assert.equal(out.timedOut, false);
+});
+
+test("cancelPendingCommand marks a still-pending command with the same id as cancelled", () => {
+  const content = JSON.stringify({ command: "runExtendScript", commandId: "abc", status: "pending" });
+  const updated = cancelPendingCommand(content, "abc");
+  assert.ok(updated);
+  assert.equal(JSON.parse(updated).status, "cancelled");
+  assert.equal(JSON.parse(updated).command, "runExtendScript");
+});
+
+test("cancelPendingCommand leaves other commands and non-pending states untouched", () => {
+  assert.equal(cancelPendingCommand(JSON.stringify({ commandId: "other", status: "pending" }), "abc"), undefined);
+  assert.equal(cancelPendingCommand(JSON.stringify({ commandId: "abc", status: "running" }), "abc"), undefined);
+  assert.equal(cancelPendingCommand("not json", "abc"), undefined);
 });

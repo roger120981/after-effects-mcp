@@ -97,3 +97,20 @@ export async function waitForCommandResult(
     elapsed += step;
   }
 }
+
+/**
+ * Returns the command file content with status "cancelled" when it still holds
+ * the given pending command, so the AE bridge never runs it after the caller gave up.
+ * Returns undefined when there is nothing to cancel.
+ */
+export function cancelPendingCommand(commandText: string, commandId: string): string | undefined {
+  try {
+    const parsed = JSON.parse(commandText);
+    if (parsed && parsed.commandId === commandId && parsed.status === "pending") {
+      return JSON.stringify({ ...parsed, status: "cancelled" }, null, 2);
+    }
+  } catch {
+    // unreadable command file: nothing to cancel
+  }
+  return undefined;
+}

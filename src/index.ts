@@ -12,6 +12,7 @@ import {
   createCommandId,
   resolveBridgeDir,
   waitForCommandResult,
+  cancelPendingCommand,
 } from "./bridge-protocol.js";
 
 // Create an MCP server
@@ -372,6 +373,14 @@ server.tool(
       (ms) => new Promise<void>((r) => setTimeout(r, ms))
     );
     if (outcome.timedOut) {
+      // Withdraw the command so the bridge does not run it later by surprise.
+      try {
+        const commandPath = path.join(getAETempDir(), 'ae_command.json');
+        const cancelled = cancelPendingCommand(fs.readFileSync(commandPath, 'utf8'), commandId);
+        if (cancelled) fs.writeFileSync(commandPath, cancelled);
+      } catch (error) {
+        console.error("Could not cancel timed-out command:", error);
+      }
       return {
         content: [{
           type: "text",
