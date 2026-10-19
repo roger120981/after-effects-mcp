@@ -137,3 +137,24 @@ test("JobRegistry tail keeps only the last lines", () => {
   c.stdout.emit("data", "1\n2\n3\n4\n5\n");
   assert.equal(reg.status("t")!.tail, "3\n4\n5");
 });
+
+test("JobRegistry keeps the log bounded but still reports the latest progress", () => {
+  const reg = new JobRegistry({ maxLogChars: 200 });
+  const child = fakeChild();
+  reg.createJob("big", child);
+  for (let i = 1; i <= 500; i++) child.stdout.emit("data", `PROGRESS:  0;00;00;01 (${i}): 0 Seconds\n`);
+  const s = reg.status("big")!;
+  assert.equal(s.framesRendered, 500);
+  assert.ok(reg.logLength("big")! <= 200);
+});
+
+test("JobRegistry evicts the oldest finished jobs beyond maxJobs", () => {
+  const reg = new JobRegistry({ maxJobs: 2 });
+  const a = fakeChild(), b = fakeChild(), c = fakeChild();
+  reg.createJob("a", a); a.emit("close", 0);
+  reg.createJob("b", b); b.emit("close", 0);
+  reg.createJob("c", c);
+  assert.equal(reg.status("a"), undefined);
+  assert.ok(reg.status("b"));
+  assert.ok(reg.status("c"));
+});

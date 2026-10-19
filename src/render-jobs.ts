@@ -108,17 +108,41 @@ export class JobRegistry {
   private jobs = new Map<string, Job>();
   private now: () => number;
   private tailLines: number;
+  private maxLogChars: number;
+  private maxJobs: number;
 
-  constructor(opts: { now?: () => number; tailLines?: number } = {}) {
+  constructor(opts: { now?: () => number; tailLines?: number; maxLogChars?: number; maxJobs?: number } = {}) {
     this.now = opts.now ?? Date.now;
     this.tailLines = opts.tailLines ?? 20;
+    // aerender prints one PROGRESS line per frame: keep only a rolling window of the log.
+    this.maxLogChars = opts.maxLogChars ?? 64 * 1024;
+    this.maxJobs = opts.maxJobs ?? 50;
+  }
+
+  /** Current length of the retained log (for diagnostics and tests). */
+  logLength(id: string): number | undefined {
+    return this.jobs.get(id)?.log.length;
+  }
+
+  private evictFinished(): void {
+    for (const [id, job] of this.jobs) {
+      if (this.jobs.size <= this.maxJobs) break;
+      if (job.finishedAt !== undefined) this.jobs.delete(id);
+    }
   }
 
   createJob(id: string, child: ChildLike, meta: { outputPath?: string } = {}): void {
     const job: Job = { log: "", failed: false, startedAt: this.now(), outputPath: meta.outputPath };
     this.jobs.set(id, job);
+    this.evictFinished();
     const append = (chunk: unknown) => {
       job.log += String(chunk);
+      if (job.log.length > this.maxLogChars) {
+        const cut = job.log.slice(-this.maxLogChars);
+        // drop the partial first line so parsing never sees a truncated line
+        const nl = cut.indexOf("\n");
+        job.log = nl >= 0 && nl < cut.length - 1 ? cut.slice(nl + 1) : cut;
+      }
     };
     child.stdout?.on("data", append);
     child.stderr?.on("data", append);
