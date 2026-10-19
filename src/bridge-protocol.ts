@@ -41,17 +41,16 @@ export interface ResolveBridgeDirOptions {
   env: Record<string, string | undefined>;
   platform: string;
   homedir: string;
-  queryWindowsDocuments?: () => string | undefined;
 }
 
-// Precedence: AE_MCP_BRIDGE_DIR > Windows known-folder Documents > homedir/Documents
+// Precedence: AE_MCP_BRIDGE_DIR > win32 %APPDATA% (local, not OneDrive-synced) > homedir/Documents
 export function resolveBridgeDir(opts: ResolveBridgeDirOptions): string {
   const override = opts.env.AE_MCP_BRIDGE_DIR;
   if (override) return override;
   const p = opts.platform === "win32" ? path.win32 : path.posix;
-  if (opts.platform === "win32" && opts.queryWindowsDocuments) {
-    const docs = opts.queryWindowsDocuments();
-    if (docs) return p.join(docs, "ae-mcp-bridge");
+  if (opts.platform === "win32") {
+    const appData = opts.env.APPDATA;
+    if (appData) return p.join(appData, "ae-mcp-bridge");
   }
   return p.join(opts.homedir, "Documents", "ae-mcp-bridge");
 }

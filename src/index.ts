@@ -1,6 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { execSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -29,31 +28,16 @@ const __dirname = path.dirname(__filename);
 const SCRIPTS_DIR = path.join(__dirname, "scripts");
 const TEMP_DIR = path.join(__dirname, "temp");
 
-// Ask Windows for the real Documents folder (handles OneDrive redirection),
-// which is the same location AE reports as Folder.myDocuments.
-function queryWindowsDocuments(): string | undefined {
-  try {
-    const out = execSync(
-      `powershell -NoProfile -Command "[Environment]::GetFolderPath('MyDocuments')"`,
-      { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "ignore"] }
-    ).trim();
-    return out || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 let cachedBridgeDir: string | undefined;
 
 // Get the directory for AE bridge files. Resolution order:
-// AE_MCP_BRIDGE_DIR > Windows known-folder Documents > ~/Documents
+// AE_MCP_BRIDGE_DIR > %APPDATA% on Windows > ~/Documents
 function getAETempDir(): string {
   if (!cachedBridgeDir) {
     cachedBridgeDir = resolveBridgeDir({
       env: process.env,
       platform: process.platform,
       homedir: os.homedir(),
-      queryWindowsDocuments,
     });
   }
   // Ensure the directory exists
@@ -457,7 +441,7 @@ Arbitrary ExtendScript (opt-in):
   Disabled unless the server is started with AE_MCP_ALLOW_SCRIPTS=1.
   The code is a function body: use \`return\` to send a value back.
 - AE_MCP_BRIDGE_DIR overrides the bridge folder (set it for both the server and After Effects).
-  By default the server and AE both use the Windows Documents folder (OneDrive-aware) / ae-mcp-bridge.
+  By default the server and AE both use %APPDATA%\\ae-mcp-bridge on Windows (local, not OneDrive-synced) and ~/Documents/ae-mcp-bridge elsewhere.
 - AE needs Preferences > Scripting & Expressions > "Allow Scripts to Write Files and Access Network".
 
 Note: The auto-running panel can be left open in After Effects to continuously listen for commands from external applications.`

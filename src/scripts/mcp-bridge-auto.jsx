@@ -1317,13 +1317,16 @@ autoRunCheckbox.value = true;
 var checkInterval = 2000;
 var isChecking = false;
 
-// Bridge folder: AE_MCP_BRIDGE_DIR env override, else Documents/ae-mcp-bridge
+// Bridge folder: AE_MCP_BRIDGE_DIR env override; else %APPDATA%\\ae-mcp-bridge on Windows
+// (Folder.userData, local and not OneDrive-synced); else Documents/ae-mcp-bridge
 function getBridgeFolder() {
     var override = "";
     try { override = $.getenv("AE_MCP_BRIDGE_DIR") || ""; } catch (envErr) { override = ""; }
     var bridgeFolder;
     if (override && override.length > 0) {
         bridgeFolder = new Folder(override);
+    } else if ($.os.indexOf("Windows") !== -1) {
+        bridgeFolder = new Folder(Folder.userData.fsName + "/ae-mcp-bridge");
     } else {
         bridgeFolder = new Folder(Folder.myDocuments.fsName + "/ae-mcp-bridge");
     }
@@ -1331,6 +1334,16 @@ function getBridgeFolder() {
         bridgeFolder.create();
     }
     return bridgeFolder;
+}
+
+// ExtendScript (ES3) has no Date.prototype.toISOString; build ISO-8601 UTC manually.
+function isoNow() {
+    var d = new Date();
+    function p2(n) { return (n < 10 ? "0" : "") + n; }
+    function p3(n) { return (n < 10 ? "00" : (n < 100 ? "0" : "")) + n; }
+    return d.getUTCFullYear() + "-" + p2(d.getUTCMonth() + 1) + "-" + p2(d.getUTCDate()) +
+        "T" + p2(d.getUTCHours()) + ":" + p2(d.getUTCMinutes()) + ":" + p2(d.getUTCSeconds()) +
+        "." + p3(d.getUTCMilliseconds()) + "Z";
 }
 
 // Command file path
@@ -1645,10 +1658,10 @@ function executeCommand(command, args, commandId) {
         // Try to parse the result as JSON to add a timestamp
         try {
             var resultObj = JSON.parse(resultString);
-            // Add a timestamp to help identify if we're getting fresh results
-            resultObj._responseTimestamp = new Date().toISOString();
-            resultObj._commandExecuted = command;
+            // Stamp id and command first so a timestamp failure can never prevent correlation
             if (commandId) resultObj._commandId = commandId;
+            resultObj._commandExecuted = command;
+            resultObj._responseTimestamp = isoNow();
             resultString = JSON.stringify(resultObj, null, 2);
             logToPanel("Added timestamp to result JSON for tracking freshness.");
         } catch (parseError) {
@@ -1701,7 +1714,9 @@ function executeCommand(command, args, commandId) {
                 message: error.toString(),
                 line: error.line,
                 fileName: error.fileName,
-                _commandId: commandId || null
+                _commandId: commandId || null,
+                _commandExecuted: command,
+                _responseTimestamp: isoNow()
             });
             var errorFile = new File(getResultFilePath());
             errorFile.encoding = "UTF-8";

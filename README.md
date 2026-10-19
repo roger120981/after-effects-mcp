@@ -238,9 +238,13 @@ Parameters: `code` (a function body; use `return` to send a value back) and opti
 
 After Effects must have **Preferences > Scripting & Expressions > "Allow Scripts to Write Files and Access Network"** enabled, and the "MCP Bridge Auto" panel open with Auto-run on.
 
-## Bridge folder (OneDrive)
+## Bridge folder location
 
-The server and the After Effects panel exchange `ae_command.json` / `ae_mcp_result.json` through a shared folder. By default both use the Windows Documents folder + `ae-mcp-bridge`; the server asks Windows for the real Documents path, so OneDrive-redirected Documents (`C:\Users\<you>\OneDrive\Documents`) work. Elsewhere it falls back to `~/Documents/ae-mcp-bridge`.
+The server and the After Effects panel exchange `ae_command.json` / `ae_mcp_result.json` through a shared folder. Resolution order (the same on both sides):
+
+1. `AE_MCP_BRIDGE_DIR`, if set and non-empty.
+2. Windows: `%APPDATA%\ae-mcp-bridge` (for example `C:\Users\<you>\AppData\Roaming\ae-mcp-bridge`). This is a local folder and is not synced by OneDrive. The panel uses `Folder.userData`, which is `%APPDATA%` on Windows.
+3. macOS/Linux: `~/Documents/ae-mcp-bridge` (the panel uses `Folder.myDocuments`).
 
 To use a custom folder, set `AE_MCP_BRIDGE_DIR` for **both** the MCP server and After Effects (the panel reads it with `$.getenv`, so it must be in the environment AE is launched from).
 

@@ -45,49 +45,36 @@ test("matchesCommand tolerates invalid or empty JSON", () => {
 
 test("resolveBridgeDir: env override wins", () => {
   const dir = resolveBridgeDir({
-    env: { AE_MCP_BRIDGE_DIR: "D:\\bridge" },
+    env: { AE_MCP_BRIDGE_DIR: "D:\\bridge", APPDATA: "C:\\Users\\admin\\AppData\\Roaming" },
     platform: "win32",
     homedir: "C:\\Users\\admin",
-    queryWindowsDocuments: () => "C:\\Users\\admin\\OneDrive\\Documents",
   });
   assert.equal(dir, "D:\\bridge");
 });
 
-test("resolveBridgeDir: empty env is ignored; win32 uses known Documents folder", () => {
+test("resolveBridgeDir: win32 uses APPDATA (local, not OneDrive)", () => {
   const dir = resolveBridgeDir({
-    env: { AE_MCP_BRIDGE_DIR: "" },
+    env: { AE_MCP_BRIDGE_DIR: "", APPDATA: "C:\\Users\\admin\\AppData\\Roaming" },
     platform: "win32",
     homedir: "C:\\Users\\admin",
-    queryWindowsDocuments: () => "C:\\Users\\admin\\OneDrive\\Documents",
   });
-  assert.equal(dir, "C:\\Users\\admin\\OneDrive\\Documents\\ae-mcp-bridge");
+  assert.equal(dir, "C:\\Users\\admin\\AppData\\Roaming\\ae-mcp-bridge");
 });
 
-test("resolveBridgeDir: win32 falls back to homedir when query yields nothing", () => {
-  for (const q of [() => undefined, () => ""]) {
-    const dir = resolveBridgeDir({
-      env: {},
-      platform: "win32",
-      homedir: "C:\\Users\\admin",
-      queryWindowsDocuments: q,
-    });
+test("resolveBridgeDir: win32 with empty or missing APPDATA falls back to Documents", () => {
+  for (const env of [{ APPDATA: "" }, {}]) {
+    const dir = resolveBridgeDir({ env, platform: "win32", homedir: "C:\\Users\\admin" });
     assert.equal(dir, "C:\\Users\\admin\\Documents\\ae-mcp-bridge");
   }
 });
 
-test("resolveBridgeDir: non-windows ignores the Windows query", () => {
-  let called = false;
+test("resolveBridgeDir: non-windows ignores APPDATA", () => {
   const dir = resolveBridgeDir({
-    env: {},
+    env: { APPDATA: "/should/be/ignored" },
     platform: "darwin",
     homedir: "/Users/a",
-    queryWindowsDocuments: () => {
-      called = true;
-      return "X";
-    },
   });
   assert.equal(dir, "/Users/a/Documents/ae-mcp-bridge");
-  assert.equal(called, false);
 });
 
 test("clampTimeout applies default, min and max", () => {
