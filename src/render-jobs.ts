@@ -1,6 +1,7 @@
 // Helpers for asynchronous renders through aerender (no spawning here).
 // Job records and logs live on disk so they survive MCP server restarts.
 import * as fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import * as path from "node:path";
 
 export interface ResolveAerenderOptions {
@@ -137,14 +138,39 @@ export function readLogTail(file: string, maxBytes = DEFAULT_TAIL_BYTES): string
   }
 }
 
-/** Default liveness check: signal 0 probes the pid without killing it. */
+/** Image name for `pid` in `tasklist /FO CSV /NH` output, or undefined (also for "INFO: No tasks..."). */
+export function parseTasklistCsv(output: string, pid: number): string | undefined {
+  for (const line of output.split(/\r?\n/)) {
+    const m = line.match(/^"([^"]*)","(\d+)"/);
+    if (m && Number(m[2]) === pid) return m[1];
+  }
+  return undefined;
+}
+
+/**
+ * Default liveness check. On Windows the pid must also belong to aerender (guards against PID reuse
+ * after a restart); elsewhere signal 0 probes the pid without killing it.
+ */
 export function isProcessAlive(pid: number): boolean {
   try {
+    if (process.platform === "win32") {
+      const out = execFileSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+        encoding: "utf8", windowsHide: true, timeout: 5000,
+      });
+      const image = parseTasklistCsv(out, pid);
+      return image !== undefined && /^aerender(\.exe)?$/i.test(image);
+    }
     process.kill(pid, 0);
     return true;
   } catch (e) {
-    return (e as NodeJS.ErrnoException).code === "EPERM";
+    return process.platform !== "win32" && (e as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+function sleepSync(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch { /* ignore */ }
 }
 
 export interface RenderJobRecord {
@@ -178,8 +204,13 @@ export interface RenderJobStoreOptions {
   isAlive?: (pid: number) => boolean;
   tailBytes?: number;
   tailLines?: number;
+  renameSync?: (from: string, to: string) => void;
+  sleep?: (ms: number) => void;
 }
 
+const RENAME_ATTEMPTS = 5;
+const RENAME_BACKOFF_MS = 20;
+const TMP_MAX_AGE_MS = 24 * 3600 * 1000;
 const SAFE_ID = /^[A-Za-z0-9_-]+$/;
 
 export class RenderJobStore {
@@ -188,6 +219,8 @@ export class RenderJobStore {
   private isAlive: (pid: number) => boolean;
   private tailBytes: number;
   private tailLines: number;
+  private rename: (from: string, to: string) => void;
+  private sleep: (ms: number) => void;
 
   constructor(dir: string, opts: RenderJobStoreOptions = {}) {
     this.dir = dir;
@@ -195,6 +228,8 @@ export class RenderJobStore {
     this.isAlive = opts.isAlive ?? isProcessAlive;
     this.tailBytes = opts.tailBytes ?? DEFAULT_TAIL_BYTES;
     this.tailLines = opts.tailLines ?? 20;
+    this.rename = opts.renameSync ?? fs.renameSync;
+    this.sleep = opts.sleep ?? sleepSync;
   }
 
   ensureDir(): void {
@@ -219,22 +254,43 @@ export class RenderJobStore {
     this.ensureDir();
     const file = this.recordPathFor(record.jobId);
     const tmp = `${file}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(record, null, 2));
-    fs.renameSync(tmp, file);
+    const body = JSON.stringify(record, null, 2);
+    fs.writeFileSync(tmp, body);
+    // Windows can refuse the rename (EPERM/EBUSY) while a reader holds the target open.
+    for (let attempt = 1; attempt <= RENAME_ATTEMPTS; attempt++) {
+      try {
+        this.rename(tmp, file);
+        return;
+      } catch {
+        if (attempt < RENAME_ATTEMPTS) this.sleep(RENAME_BACKOFF_MS * attempt);
+      }
+    }
+    fs.writeFileSync(file, body);
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
   }
 
   load(id: string): RenderJobRecord | undefined {
     if (!SAFE_ID.test(id)) return undefined;
     try {
-      return JSON.parse(fs.readFileSync(this.recordPathFor(id), "utf8")) as RenderJobRecord;
+      const r = JSON.parse(fs.readFileSync(this.recordPathFor(id), "utf8")) as RenderJobRecord;
+      // The file name is the identity; never trust the content to name another job or path.
+      if (!r || r.jobId !== id) return undefined;
+      return { ...r, logPath: this.logPathFor(id) };
     } catch {
       return undefined;
     }
   }
 
-  update(id: string, patch: Partial<RenderJobRecord>): void {
-    const current = this.load(id);
-    if (current) this.save({ ...current, ...patch, jobId: id });
+  /** Never throws; returns whether the record was updated. */
+  update(id: string, patch: Partial<RenderJobRecord>): boolean {
+    try {
+      const current = this.load(id);
+      if (!current) return false;
+      this.save({ ...current, ...patch, jobId: id });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   appendLog(id: string, text: string): void {
@@ -244,7 +300,7 @@ export class RenderJobStore {
   }
 
   statusOf(record: RenderJobRecord): JobStatus {
-    const logTail = readLogTail(record.logPath || this.logPathFor(record.jobId), this.tailBytes);
+    const logTail = readLogTail(this.logPathFor(record.jobId), this.tailBytes);
     const alive = record.pid !== undefined && record.exitCode === undefined ? this.isAlive(record.pid) : false;
     const inferred = inferJobState({ exitCode: record.exitCode, alive, logTail });
     const started = Date.parse(record.startedAt);
@@ -259,7 +315,7 @@ export class RenderJobStore {
       lastLine: inferred.lastLine,
       elapsedSeconds: Math.max(0, Math.round((end - started) / 1000)),
       outputPath: record.outputPath,
-      logPath: record.logPath,
+      logPath: this.logPathFor(record.jobId),
       tail: lines.slice(-this.tailLines).join("\n"),
     };
   }
@@ -294,15 +350,29 @@ export class RenderJobStore {
     } catch {
       return;
     }
+    this.pruneTmp();
     for (const name of names) {
       const id = name.slice(0, -".json".length);
       const r = this.load(id);
       if (!r) continue;
       if (this.now() - Date.parse(r.startedAt) <= maxAgeMs) continue;
       if (r.exitCode === undefined && r.pid !== undefined && this.isAlive(r.pid)) continue;
-      for (const f of [this.recordPathFor(id), r.logPath || this.logPathFor(id)]) {
+      for (const f of [this.recordPathFor(id), this.logPathFor(id)]) {
         try { fs.rmSync(f, { force: true }); } catch { /* ignore */ }
       }
     }
+  }
+
+  /** Remove orphaned `*.json.tmp` files (crash between write and rename) older than a day. */
+  private pruneTmp(): void {
+    try {
+      for (const n of fs.readdirSync(this.dir)) {
+        if (!n.endsWith(".json.tmp")) continue;
+        const f = path.join(this.dir, n);
+        try {
+          if (this.now() - fs.statSync(f).mtimeMs > TMP_MAX_AGE_MS) fs.rmSync(f, { force: true });
+        } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
   }
 }

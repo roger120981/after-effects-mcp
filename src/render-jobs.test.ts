@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, utimesSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,6 +9,7 @@ import {
   parseAerenderProgress,
   inferJobState,
   readLogTail,
+  parseTasklistCsv,
   RenderJobStore,
   type RenderJobRecord,
 } from "./render-jobs.ts";
@@ -223,5 +224,89 @@ test("RenderJobStore.prune removes old finished records and logs", () => {
     assert.equal(existsSync(store.logPathFor("old")), false);
     assert.ok(store.load("new"));
     void state;
+  });
+});
+
+function flaky(failures: number, code = "EPERM") {
+  let calls = 0;
+  const fn = (from: string, to: string) => {
+    calls++;
+    if (calls <= failures) throw Object.assign(new Error("locked"), { code });
+    renameSync(from, to);
+  };
+  return { fn, calls: () => calls };
+}
+
+test("RenderJobStore.save retries a rename that fails transiently", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rj-"));
+  try {
+    const f = flaky(2);
+    const store = new RenderJobStore(join(dir, "jobs"), { renameSync: f.fn, sleep: () => {} });
+    store.save(rec("j", "2026-01-10T00:00:00Z"));
+    assert.equal(f.calls(), 3);
+    assert.equal(store.load("j")?.jobId, "j");
+    assert.equal(existsSync(`${store.recordPathFor("j")}.tmp`), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RenderJobStore.save falls back to a direct write when rename always fails; update never throws", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rj-"));
+  try {
+    const store = new RenderJobStore(join(dir, "jobs"), {
+      renameSync: () => { throw Object.assign(new Error("busy"), { code: "EBUSY" }); },
+      sleep: () => {},
+    });
+    store.save(rec("j", "2026-01-10T00:00:00Z"));
+    assert.equal(store.load("j")?.jobId, "j");
+    assert.equal(store.update("j", { exitCode: 0 }), true);
+    assert.equal(store.load("j")?.exitCode, 0);
+    assert.equal(store.update("missing", { exitCode: 0 }), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("parseTasklistCsv returns the image name for the pid", () => {
+  assert.equal(parseTasklistCsv('"aerender.exe","1234","Console","1","50,000 K"\r\n', 1234), "aerender.exe");
+  assert.equal(parseTasklistCsv('"chrome.exe","1234","Console","1","50,000 K"', 1234), "chrome.exe");
+  assert.equal(parseTasklistCsv('"aerender.exe","99","Console","1","5 K"', 1234), undefined);
+  assert.equal(parseTasklistCsv("INFO: No tasks are running which match the specified criteria.", 1234), undefined);
+  assert.equal(parseTasklistCsv("", 1234), undefined);
+});
+
+test("RenderJobStore ignores tampered logPath and mismatched jobId", () => {
+  withStore((store, dir) => {
+    store.ensureDir();
+    const outside = join(dir, "secret.log");
+    writeFileSync(outside, "PROGRESS: Total Time Elapsed: 1 Seconds\n");
+    store.save(rec("t", "2025-12-01T00:00:00Z", { logPath: outside, exitCode: 0 }));
+    writeFileSync(store.logPathFor("t"), "own log\n");
+    assert.match(store.status("t")!.tail, /own log/);
+    assert.equal(store.status("t")!.logPath, store.logPathFor("t"));
+    store.prune(1000);
+    assert.equal(existsSync(outside), true);
+    assert.equal(existsSync(store.logPathFor("t")), false);
+    // record whose jobId does not match its file name is ignored
+    writeFileSync(join(store.dir, "a.json"), JSON.stringify(rec("b", "2026-01-10T00:00:00Z")));
+    assert.equal(store.load("a"), undefined);
+    assert.deepEqual(store.list(10), []);
+  });
+});
+
+test("RenderJobStore.prune removes stale orphaned .json.tmp files only", () => {
+  withStore((store, _dir, state) => {
+    store.ensureDir();
+    const oldTmp = join(store.dir, "x.json.tmp");
+    const freshTmp = join(store.dir, "y.json.tmp");
+    writeFileSync(oldTmp, "{}");
+    writeFileSync(freshTmp, "{}");
+    state.now = Date.now();
+    const old = new Date(state.now - 2 * 24 * 3600 * 1000);
+    utimesSync(oldTmp, old, old);
+    store.prune(7 * 24 * 3600 * 1000);
+    assert.equal(existsSync(oldTmp), false);
+    assert.equal(existsSync(freshTmp), true);
   });
 });

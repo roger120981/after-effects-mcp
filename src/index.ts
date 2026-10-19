@@ -447,11 +447,19 @@ server.tool(
       record = { jobId, pid: child.pid, aerender, args, projectPath, compName, outputPath, logPath, startedAt: new Date().toISOString() };
       store.save(record);
       child.on("error", (err: Error) => {
-        store.appendLog(jobId, `\nspawn error: ${err.message}\n`);
-        store.update(jobId, { exitCode: -1, finishedAt: new Date().toISOString() });
+        try {
+          store.appendLog(jobId, `\nspawn error: ${err.message}\n`);
+          store.update(jobId, { exitCode: -1, finishedAt: new Date().toISOString() });
+        } catch (e) {
+          console.error(`render job ${jobId}: failed to record spawn error`, e);
+        }
       });
       child.on("exit", (code: number | null) => {
-        store.update(jobId, { exitCode: code ?? -1, finishedAt: new Date().toISOString() });
+        try {
+          store.update(jobId, { exitCode: code ?? -1, finishedAt: new Date().toISOString() });
+        } catch (e) {
+          console.error(`render job ${jobId}: failed to record exit`, e);
+        }
       });
       child.unref();
     } catch (error) {
