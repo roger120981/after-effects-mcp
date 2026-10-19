@@ -1,4 +1,7 @@
-// Pure helpers for asynchronous renders through aerender (no spawning here).
+// Helpers for asynchronous renders through aerender (no spawning here).
+// Job records and logs live on disk so they survive MCP server restarts.
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 export interface ResolveAerenderOptions {
   env: Record<string, string | undefined>;
@@ -54,11 +57,16 @@ export interface AerenderProgress {
   framesRendered?: number;
 }
 
+// Only lines that START with an error marker count; "ERROR:" inside a path or message does not.
+function isErrorLine(line: string): boolean {
+  return /^(aerender ERROR|ERROR:|Error:)/.test(line.trim());
+}
+
 export function parseAerenderProgress(logText: string): AerenderProgress {
   const lines = logText.split(/\r?\n/).filter((l) => l.trim() !== "");
   const lastLine = lines.length ? lines[lines.length - 1] : "";
   let state: AerenderProgress["state"] = "running";
-  if (lines.some((l) => /^\s*aerender ERROR/.test(l) || l.includes("ERROR:"))) {
+  if (lines.some(isErrorLine)) {
     state = "error";
   } else if (/Finished composition|Total Time Elapsed/.test(logText)) {
     state = "done";
@@ -76,105 +84,225 @@ export function parseAerenderProgress(logText: string): AerenderProgress {
   return result;
 }
 
-interface Emitter {
-  on(event: string, listener: (...args: any[]) => void): unknown;
+export type JobState = "running" | "done" | "error" | "unknown";
+
+export interface InferJobStateInput {
+  exitCode?: number;
+  alive: boolean;
+  logTail: string;
 }
-export interface ChildLike extends Emitter {
-  stdout?: Emitter | null;
-  stderr?: Emitter | null;
+
+export function inferJobState(input: InferJobStateInput): {
+  state: JobState;
+  framesRendered?: number;
+  lastLine: string;
+} {
+  const progress = parseAerenderProgress(input.logTail);
+  const base = { framesRendered: progress.framesRendered, lastLine: progress.lastLine };
+  if (input.exitCode !== undefined) return { ...base, state: input.exitCode === 0 ? "done" : "error" };
+  if (input.alive) return { ...base, state: "running" };
+  // Process gone and no exit code recorded (server restarted meanwhile): trust the log.
+  if (progress.state === "error") return { ...base, state: "error" };
+  if (progress.state === "done") return { ...base, state: "done" };
+  return { ...base, state: "unknown" };
+}
+
+export const DEFAULT_TAIL_BYTES = 64 * 1024;
+
+/** Read at most the last `maxBytes` of a file ("" if unreadable). Drops a partial first line. */
+export function readLogTail(file: string, maxBytes = DEFAULT_TAIL_BYTES): string {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, "r");
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - maxBytes);
+    const len = size - start;
+    const buf = Buffer.alloc(len);
+    let read = 0;
+    while (read < len) {
+      const n = fs.readSync(fd, buf, read, len - read, start + read);
+      if (n <= 0) break;
+      read += n;
+    }
+    const text = buf.subarray(0, read).toString("utf8");
+    if (start === 0) return text;
+    const nl = text.indexOf("\n");
+    return nl >= 0 && nl < text.length - 1 ? text.slice(nl + 1) : text;
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
+/** Default liveness check: signal 0 probes the pid without killing it. */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+export interface RenderJobRecord {
+  jobId: string;
+  pid?: number;
+  aerender: string;
+  args: string[];
+  projectPath: string;
+  compName: string;
+  outputPath: string;
+  logPath: string;
+  startedAt: string;
+  exitCode?: number;
+  finishedAt?: string;
 }
 
 export interface JobStatus {
   jobId: string;
-  state: "running" | "done" | "error";
+  state: JobState;
   exitCode?: number;
   framesRendered?: number;
   lastLine: string;
   elapsedSeconds: number;
   outputPath?: string;
+  logPath: string;
   tail: string;
 }
 
-interface Job {
-  log: string;
-  exitCode?: number;
-  failed: boolean;
-  startedAt: number;
-  finishedAt?: number;
-  outputPath?: string;
+export interface RenderJobStoreOptions {
+  now?: () => number;
+  isAlive?: (pid: number) => boolean;
+  tailBytes?: number;
+  tailLines?: number;
 }
 
-export class JobRegistry {
-  private jobs = new Map<string, Job>();
+const SAFE_ID = /^[A-Za-z0-9_-]+$/;
+
+export class RenderJobStore {
+  readonly dir: string;
   private now: () => number;
+  private isAlive: (pid: number) => boolean;
+  private tailBytes: number;
   private tailLines: number;
-  private maxLogChars: number;
-  private maxJobs: number;
 
-  constructor(opts: { now?: () => number; tailLines?: number; maxLogChars?: number; maxJobs?: number } = {}) {
+  constructor(dir: string, opts: RenderJobStoreOptions = {}) {
+    this.dir = dir;
     this.now = opts.now ?? Date.now;
+    this.isAlive = opts.isAlive ?? isProcessAlive;
+    this.tailBytes = opts.tailBytes ?? DEFAULT_TAIL_BYTES;
     this.tailLines = opts.tailLines ?? 20;
-    // aerender prints one PROGRESS line per frame: keep only a rolling window of the log.
-    this.maxLogChars = opts.maxLogChars ?? 64 * 1024;
-    this.maxJobs = opts.maxJobs ?? 50;
   }
 
-  /** Current length of the retained log (for diagnostics and tests). */
-  logLength(id: string): number | undefined {
-    return this.jobs.get(id)?.log.length;
+  ensureDir(): void {
+    fs.mkdirSync(this.dir, { recursive: true });
   }
 
-  private evictFinished(): void {
-    for (const [id, job] of this.jobs) {
-      if (this.jobs.size <= this.maxJobs) break;
-      if (job.finishedAt !== undefined) this.jobs.delete(id);
+  private assertId(id: string): void {
+    if (!SAFE_ID.test(id)) throw new Error(`Invalid jobId: ${id}`);
+  }
+
+  recordPathFor(id: string): string {
+    this.assertId(id);
+    return path.join(this.dir, `${id}.json`);
+  }
+
+  logPathFor(id: string): string {
+    this.assertId(id);
+    return path.join(this.dir, `${id}.log`);
+  }
+
+  save(record: RenderJobRecord): void {
+    this.ensureDir();
+    const file = this.recordPathFor(record.jobId);
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(record, null, 2));
+    fs.renameSync(tmp, file);
+  }
+
+  load(id: string): RenderJobRecord | undefined {
+    if (!SAFE_ID.test(id)) return undefined;
+    try {
+      return JSON.parse(fs.readFileSync(this.recordPathFor(id), "utf8")) as RenderJobRecord;
+    } catch {
+      return undefined;
     }
   }
 
-  createJob(id: string, child: ChildLike, meta: { outputPath?: string } = {}): void {
-    const job: Job = { log: "", failed: false, startedAt: this.now(), outputPath: meta.outputPath };
-    this.jobs.set(id, job);
-    this.evictFinished();
-    const append = (chunk: unknown) => {
-      job.log += String(chunk);
-      if (job.log.length > this.maxLogChars) {
-        const cut = job.log.slice(-this.maxLogChars);
-        // drop the partial first line so parsing never sees a truncated line
-        const nl = cut.indexOf("\n");
-        job.log = nl >= 0 && nl < cut.length - 1 ? cut.slice(nl + 1) : cut;
-      }
+  update(id: string, patch: Partial<RenderJobRecord>): void {
+    const current = this.load(id);
+    if (current) this.save({ ...current, ...patch, jobId: id });
+  }
+
+  appendLog(id: string, text: string): void {
+    try {
+      fs.appendFileSync(this.logPathFor(id), text);
+    } catch { /* best effort */ }
+  }
+
+  statusOf(record: RenderJobRecord): JobStatus {
+    const logTail = readLogTail(record.logPath || this.logPathFor(record.jobId), this.tailBytes);
+    const alive = record.pid !== undefined && record.exitCode === undefined ? this.isAlive(record.pid) : false;
+    const inferred = inferJobState({ exitCode: record.exitCode, alive, logTail });
+    const started = Date.parse(record.startedAt);
+    const finished = record.finishedAt ? Date.parse(record.finishedAt) : undefined;
+    const end = inferred.state === "running" || finished === undefined ? this.now() : finished;
+    const lines = logTail.split(/\r?\n/).filter((l) => l.trim() !== "");
+    return {
+      jobId: record.jobId,
+      state: inferred.state,
+      exitCode: record.exitCode,
+      framesRendered: inferred.framesRendered,
+      lastLine: inferred.lastLine,
+      elapsedSeconds: Math.max(0, Math.round((end - started) / 1000)),
+      outputPath: record.outputPath,
+      logPath: record.logPath,
+      tail: lines.slice(-this.tailLines).join("\n"),
     };
-    child.stdout?.on("data", append);
-    child.stderr?.on("data", append);
-    child.on("error", (err: Error) => {
-      job.log += `\nspawn error: ${err.message}\n`;
-      job.failed = true;
-      job.finishedAt ??= this.now();
-    });
-    child.on("close", (code: number | null) => {
-      job.exitCode = code ?? -1;
-      job.finishedAt ??= this.now();
-    });
   }
 
   status(id: string): JobStatus | undefined {
-    const job = this.jobs.get(id);
-    if (!job) return undefined;
-    const progress = parseAerenderProgress(job.log);
-    let state = progress.state;
-    if (job.failed) state = "error";
-    else if (job.exitCode !== undefined) state = job.exitCode === 0 ? "done" : "error";
-    const end = job.finishedAt ?? this.now();
-    const lines = job.log.split(/\r?\n/).filter((l) => l !== "");
-    return {
-      jobId: id,
-      state,
-      exitCode: job.exitCode,
-      framesRendered: progress.framesRendered,
-      lastLine: progress.lastLine,
-      elapsedSeconds: Math.round((end - job.startedAt) / 1000),
-      outputPath: job.outputPath,
-      tail: lines.slice(-this.tailLines).join("\n"),
-    };
+    const record = this.load(id);
+    return record ? this.statusOf(record) : undefined;
+  }
+
+  /** Newest first. Corrupt or unreadable records are skipped. */
+  list(limit = 20): JobStatus[] {
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.dir).filter((n) => n.endsWith(".json"));
+    } catch {
+      return [];
+    }
+    const records: RenderJobRecord[] = [];
+    for (const name of names) {
+      const r = this.load(name.slice(0, -".json".length));
+      if (r && typeof r.startedAt === "string") records.push(r);
+    }
+    records.sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt));
+    return records.slice(0, Math.max(0, limit)).map((r) => this.statusOf(r));
+  }
+
+  /** Delete records (and logs) started more than maxAgeMs ago that are not running. */
+  prune(maxAgeMs: number): void {
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.dir).filter((n) => n.endsWith(".json"));
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      const id = name.slice(0, -".json".length);
+      const r = this.load(id);
+      if (!r) continue;
+      if (this.now() - Date.parse(r.startedAt) <= maxAgeMs) continue;
+      if (r.exitCode === undefined && r.pid !== undefined && this.isAlive(r.pid)) continue;
+      for (const f of [this.recordPathFor(id), r.logPath || this.logPathFor(id)]) {
+        try { fs.rmSync(f, { force: true }); } catch { /* ignore */ }
+      }
+    }
   }
 }

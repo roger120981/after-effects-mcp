@@ -13,12 +13,13 @@ import {
   waitForCommandResult,
   cancelPendingCommand,
 } from "./bridge-protocol.js";
-import { spawn } from "child_process";
+import { spawn, type ChildProcess } from "child_process";
 import { randomUUID } from "crypto";
 import {
   resolveAerenderPath,
   buildAerenderArgs,
-  JobRegistry,
+  RenderJobStore,
+  type RenderJobRecord,
 } from "./render-jobs.js";
 
 // Create an MCP server
@@ -383,12 +384,18 @@ server.tool(
   }
 );
 
-// Asynchronous rendering through aerender (does not block the AE UI thread)
-const renderJobs = new JobRegistry();
+// Asynchronous rendering through aerender (does not block the AE UI thread).
+// Jobs are detached processes with on-disk records, so they outlive the MCP server.
+const RENDER_JOB_MAX_AGE_MS = 7 * 24 * 3600 * 1000;
+let cachedRenderJobStore: RenderJobStore | undefined;
+function getRenderJobStore(): RenderJobStore {
+  cachedRenderJobStore ??= new RenderJobStore(path.join(getAETempDir(), "render-jobs"));
+  return cachedRenderJobStore;
+}
 
 server.tool(
   "render-comp",
-  "Start an asynchronous render of a composition with aerender.exe and return a jobId. The project must be saved first (aerender renders the saved .aep file). Poll with render-status. Disabled unless AE_MCP_ALLOW_SCRIPTS=1 is set for the server.",
+  "Start an asynchronous render of a composition with aerender.exe and return a jobId. The project must be saved first (aerender renders the saved .aep file). Runs detached (keeps running if the MCP server stops); poll with render-status or list-render-jobs. Disabled unless AE_MCP_ALLOW_SCRIPTS=1 is set for the server.",
   {
     projectPath: z.string().describe("Absolute path of the saved .aep project"),
     compName: z.string().describe("Name of the composition to render"),
@@ -425,12 +432,35 @@ server.tool(
       return { content: [{ type: "text", text: `Invalid render-comp arguments: ${error instanceof Error ? error.message : String(error)}` }] };
     }
     const jobId = randomUUID();
-    const child = spawn(aerender, args, { windowsHide: true });
-    renderJobs.createJob(jobId, child, { outputPath });
+    const store = getRenderJobStore();
+    let record: RenderJobRecord;
+    try {
+      store.ensureDir();
+      const logPath = store.logPathFor(jobId);
+      const logFd = fs.openSync(logPath, "a");
+      let child: ChildProcess;
+      try {
+        child = spawn(aerender, args, { detached: true, windowsHide: true, stdio: ["ignore", logFd, logFd] });
+      } finally {
+        fs.closeSync(logFd);
+      }
+      record = { jobId, pid: child.pid, aerender, args, projectPath, compName, outputPath, logPath, startedAt: new Date().toISOString() };
+      store.save(record);
+      child.on("error", (err: Error) => {
+        store.appendLog(jobId, `\nspawn error: ${err.message}\n`);
+        store.update(jobId, { exitCode: -1, finishedAt: new Date().toISOString() });
+      });
+      child.on("exit", (code: number | null) => {
+        store.update(jobId, { exitCode: code ?? -1, finishedAt: new Date().toISOString() });
+      });
+      child.unref();
+    } catch (error) {
+      return { content: [{ type: "text", text: `Failed to start aerender: ${error instanceof Error ? error.message : String(error)}` }] };
+    }
     return {
       content: [{
         type: "text",
-        text: JSON.stringify({ jobId, aerender, args, note: "poll with render-status" }, null, 2)
+        text: JSON.stringify({ jobId, pid: record.pid, aerender, args, logPath: record.logPath, note: "poll with render-status; the render keeps running if the MCP server stops" }, null, 2)
       }]
     };
   }
@@ -443,11 +473,33 @@ server.tool(
     jobId: z.string().describe("jobId returned by render-comp")
   },
   async ({ jobId }) => {
-    const status = renderJobs.status(jobId);
+    const status = getRenderJobStore().status(jobId);
     if (!status) {
-      return { content: [{ type: "text", text: `Unknown jobId: ${jobId} (jobs live only while the server process runs)` }] };
+      return { content: [{ type: "text", text: `Unknown jobId: ${jobId} (no record in ${getRenderJobStore().dir})` }] };
     }
     return { content: [{ type: "text", text: JSON.stringify(status, null, 2) }] };
+  }
+);
+
+server.tool(
+  "list-render-jobs",
+  "List recent aerender jobs recorded on disk (newest first) with compact status. Survives MCP server restarts. Records older than 7 days are pruned. Disabled unless AE_MCP_ALLOW_SCRIPTS=1 is set for the server.",
+  {
+    limit: z.number().int().min(1).max(200).optional().describe("Maximum number of jobs to return (default 20)")
+  },
+  async ({ limit }) => {
+    if (process.env.AE_MCP_ALLOW_SCRIPTS !== '1') {
+      return {
+        content: [{
+          type: "text",
+          text: "list-render-jobs is disabled. To enable it, start the MCP server with the environment variable AE_MCP_ALLOW_SCRIPTS=1 and restart the client."
+        }]
+      };
+    }
+    const store = getRenderJobStore();
+    store.prune(RENDER_JOB_MAX_AGE_MS);
+    const jobs = store.list(limit ?? 20).map(({ tail, ...compact }) => compact);
+    return { content: [{ type: "text", text: JSON.stringify({ count: jobs.length, jobs }, null, 2) }] };
   }
 );
 
@@ -515,9 +567,10 @@ Arbitrary ExtendScript (opt-in):
 - run-extendscript: run JavaScript inside After Effects and get its return value back in one call.
   Disabled unless the server is started with AE_MCP_ALLOW_SCRIPTS=1.
   Every bridge command runs with After Effects dialogs suppressed.
-- render-comp / render-status: asynchronous render through aerender (same AE_MCP_ALLOW_SCRIPTS=1 gate).
+- render-comp / render-status / list-render-jobs: asynchronous render through aerender (same AE_MCP_ALLOW_SCRIPTS=1 gate).
   Save the project first (aerender renders the .aep on disk); set AE_RENDER_EXE if aerender is not auto-detected.
-  render-comp returns a jobId; poll it with render-status.
+  render-comp returns a jobId; poll it with render-status. Renders run detached with records and logs in <bridge dir>/render-jobs,
+  so they keep running and stay queryable if the MCP server restarts. list-render-jobs shows recent jobs.
   The code is a function body: use \`return\` to send a value back.
 - AE_MCP_BRIDGE_DIR overrides the bridge folder (set it for both the server and After Effects).
   By default the server and AE both use %APPDATA%\\ae-mcp-bridge on Windows (local, not OneDrive-synced) and ~/Documents/ae-mcp-bridge elsewhere.

@@ -1,11 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   resolveAerenderPath,
   buildAerenderArgs,
   parseAerenderProgress,
-  JobRegistry,
+  inferJobState,
+  readLogTail,
+  RenderJobStore,
+  type RenderJobRecord,
 } from "./render-jobs.ts";
 
 const winExe = (year: number) =>
@@ -83,78 +88,140 @@ test("parseAerenderProgress detects running, frames, done and error", () => {
   assert.equal(parseAerenderProgress("PROGRESS: Finished composition \"Main\".\n").state, "done");
   assert.equal(parseAerenderProgress("PROGRESS: Total Time Elapsed: 17 Seconds\n").state, "done");
   assert.equal(parseAerenderProgress("aerender ERROR: No comp was found\n").state, "error");
-  assert.equal(parseAerenderProgress("something ERROR: bad\n").state, "error");
+  assert.equal(parseAerenderProgress("  ERROR: bad\n").state, "error");
+  assert.equal(parseAerenderProgress("Error: bad\n").state, "error");
+  assert.equal(parseAerenderProgress("something ERROR: bad\n").state, "running");
   assert.deepEqual(parseAerenderProgress(""), { state: "running", lastLine: "" });
 });
 
-function fakeChild() {
-  const child: any = new EventEmitter();
-  child.stdout = new EventEmitter();
-  child.stderr = new EventEmitter();
-  return child;
+test("parseAerenderProgress does not flag ERROR: in the middle of a line", () => {
+  const p = parseAerenderProgress("Writing to C:\\renders\\ERROR:test.mov\nPROGRESS:  0;00;00;05 (6): 0 Seconds\n");
+  assert.equal(p.state, "running");
+  assert.equal(p.framesRendered, 6);
+});
+
+test("inferJobState uses the exit code first", () => {
+  assert.equal(inferJobState({ exitCode: 0, alive: true, logTail: "" }).state, "done");
+  assert.equal(inferJobState({ exitCode: 1, alive: false, logTail: "Finished composition" }).state, "error");
+});
+
+test("inferJobState reports running while the process is alive", () => {
+  const r = inferJobState({ alive: true, logTail: "PROGRESS:  0;00;00;05 (6): 0 Seconds\n" });
+  assert.equal(r.state, "running");
+  assert.equal(r.framesRendered, 6);
+});
+
+test("inferJobState infers the outcome from the log when the process is gone", () => {
+  assert.equal(inferJobState({ alive: false, logTail: "PROGRESS: Total Time Elapsed: 3 Seconds\n" }).state, "done");
+  assert.equal(inferJobState({ alive: false, logTail: "Finished composition \"Main\"." }).state, "done");
+  assert.equal(inferJobState({ alive: false, logTail: "aerender ERROR: nope\n" }).state, "error");
+  assert.equal(inferJobState({ alive: false, logTail: "PROGRESS: (3)\n" }).state, "unknown");
+  assert.equal(inferJobState({ alive: false, logTail: "" }).state, "unknown");
+});
+
+test("readLogTail reads only the last bytes of a file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rj-"));
+  try {
+    const f = join(dir, "a.log");
+    writeFileSync(f, "x".repeat(1000) + "\nlast line\n");
+    const t = readLogTail(f, 50);
+    assert.ok(t.length <= 50);
+    assert.match(t, /last line/);
+    assert.equal(readLogTail(join(dir, "missing.log"), 50), "");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function withStore(fn: (store: RenderJobStore, dir: string, state: { now: number; alive: boolean }) => void) {
+  const dir = mkdtempSync(join(tmpdir(), "rj-"));
+  const state = { now: Date.parse("2026-01-10T00:00:10Z"), alive: true };
+  try {
+    fn(new RenderJobStore(join(dir, "render-jobs"), { now: () => state.now, isAlive: () => state.alive }), dir, state);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
-test("JobRegistry tracks output and exit code", () => {
-  let t = 1000;
-  const reg = new JobRegistry({ now: () => t });
-  const child = fakeChild();
-  reg.createJob("j1", child, { outputPath: "o.mp4" });
-  child.stdout.emit("data", Buffer.from("PROGRESS:  0;00;00;05 (6): 0 Seconds\n"));
-  let s = reg.status("j1")!;
-  assert.equal(s.state, "running");
-  assert.equal(s.framesRendered, 6);
-  assert.equal(s.exitCode, undefined);
-  t = 4000;
-  child.stderr.emit("data", "warn\n");
-  child.emit("close", 0);
-  s = reg.status("j1")!;
-  assert.equal(s.state, "done");
-  assert.equal(s.exitCode, 0);
-  assert.equal(s.elapsedSeconds, 3);
-  assert.equal(s.outputPath, "o.mp4");
-  assert.match(s.tail, /warn/);
+function rec(id: string, startedAt: string, extra: Partial<RenderJobRecord> = {}): RenderJobRecord {
+  return {
+    jobId: id, pid: 123, aerender: "aerender", args: ["-project", "a.aep"],
+    projectPath: "a.aep", compName: "Main", outputPath: "o.mp4",
+    logPath: "", startedAt, ...extra,
+  };
+}
+
+test("RenderJobStore persists records and reports status from disk", () => {
+  withStore((store, dir, state) => {
+    store.ensureDir();
+    const r = rec("job-1", "2026-01-10T00:00:00Z", { logPath: store.logPathFor("job-1") });
+    writeFileSync(r.logPath, "PROGRESS:  0;00;00;05 (6): 0 Seconds\n");
+    store.save(r);
+    // a fresh store instance (server restart) still sees it
+    const again = new RenderJobStore(store.dir, { now: () => state.now, isAlive: () => true });
+    const s = again.status("job-1")!;
+    assert.equal(s.state, "running");
+    assert.equal(s.framesRendered, 6);
+    assert.equal(s.elapsedSeconds, 10);
+    assert.equal(s.outputPath, "o.mp4");
+    assert.match(s.tail, /PROGRESS/);
+    assert.equal(again.status("nope"), undefined);
+  });
 });
 
-test("JobRegistry reports non-zero exit and spawn errors as error; unknown id is undefined", () => {
-  const reg = new JobRegistry();
-  const c1 = fakeChild();
-  reg.createJob("a", c1);
-  c1.emit("close", 1);
-  assert.equal(reg.status("a")!.state, "error");
-  const c2 = fakeChild();
-  reg.createJob("b", c2);
-  c2.emit("error", new Error("ENOENT"));
-  const s = reg.status("b")!;
-  assert.equal(s.state, "error");
-  assert.match(s.tail, /ENOENT/);
-  assert.equal(reg.status("zzz"), undefined);
+test("RenderJobStore.update records exit code and freezes elapsed time", () => {
+  withStore((store, _dir, state) => {
+    store.ensureDir();
+    store.save(rec("j", "2026-01-10T00:00:00Z", { logPath: store.logPathFor("j") }));
+    store.update("j", { exitCode: 0, finishedAt: "2026-01-10T00:00:04Z" });
+    state.now += 100000;
+    const s = store.status("j")!;
+    assert.equal(s.state, "done");
+    assert.equal(s.exitCode, 0);
+    assert.equal(s.elapsedSeconds, 4);
+  });
 });
 
-test("JobRegistry tail keeps only the last lines", () => {
-  const reg = new JobRegistry({ tailLines: 3 });
-  const c = fakeChild();
-  reg.createJob("t", c);
-  c.stdout.emit("data", "1\n2\n3\n4\n5\n");
-  assert.equal(reg.status("t")!.tail, "3\n4\n5");
+test("RenderJobStore reports a vanished process without exit code via the log", () => {
+  withStore((store, _dir, state) => {
+    store.ensureDir();
+    const r = rec("j", "2026-01-10T00:00:00Z", { logPath: store.logPathFor("j") });
+    writeFileSync(r.logPath, "PROGRESS: Total Time Elapsed: 3 Seconds\n");
+    store.save(r);
+    state.alive = false;
+    assert.equal(store.status("j")!.state, "done");
+  });
 });
 
-test("JobRegistry keeps the log bounded but still reports the latest progress", () => {
-  const reg = new JobRegistry({ maxLogChars: 200 });
-  const child = fakeChild();
-  reg.createJob("big", child);
-  for (let i = 1; i <= 500; i++) child.stdout.emit("data", `PROGRESS:  0;00;00;01 (${i}): 0 Seconds\n`);
-  const s = reg.status("big")!;
-  assert.equal(s.framesRendered, 500);
-  assert.ok(reg.logLength("big")! <= 200);
+test("RenderJobStore rejects unsafe job ids", () => {
+  withStore((store) => {
+    assert.equal(store.status("../etc/passwd"), undefined);
+    assert.throws(() => store.save(rec("../x", "2026-01-10T00:00:00Z")), /jobId/);
+  });
 });
 
-test("JobRegistry evicts the oldest finished jobs beyond maxJobs", () => {
-  const reg = new JobRegistry({ maxJobs: 2 });
-  const a = fakeChild(), b = fakeChild(), c = fakeChild();
-  reg.createJob("a", a); a.emit("close", 0);
-  reg.createJob("b", b); b.emit("close", 0);
-  reg.createJob("c", c);
-  assert.equal(reg.status("a"), undefined);
-  assert.ok(reg.status("b"));
-  assert.ok(reg.status("c"));
+test("RenderJobStore.list is newest first, limited, tolerant of corrupt files, and tails the log", () => {
+  withStore((store) => {
+    store.ensureDir();
+    for (const [id, at] of [["a", "2026-01-10T00:00:01Z"], ["b", "2026-01-10T00:00:03Z"], ["c", "2026-01-10T00:00:02Z"]]) {
+      store.save(rec(id, at, { logPath: store.logPathFor(id) }));
+    }
+    writeFileSync(join(store.dir, "broken.json"), "{not json");
+    assert.deepEqual(store.list(10).map((s) => s.jobId), ["b", "c", "a"]);
+    assert.deepEqual(store.list(2).map((s) => s.jobId), ["b", "c"]);
+  });
+});
+
+test("RenderJobStore.prune removes old finished records and logs", () => {
+  withStore((store, _dir, state) => {
+    store.ensureDir();
+    store.save(rec("old", "2025-12-01T00:00:00Z", { logPath: store.logPathFor("old"), exitCode: 0, finishedAt: "2025-12-01T00:01:00Z" }));
+    writeFileSync(store.logPathFor("old"), "x");
+    store.save(rec("new", "2026-01-09T00:00:00Z", { logPath: store.logPathFor("new") }));
+    store.prune(7 * 24 * 3600 * 1000);
+    assert.equal(store.load("old"), undefined);
+    assert.equal(existsSync(store.logPathFor("old")), false);
+    assert.ok(store.load("new"));
+    void state;
+  });
 });

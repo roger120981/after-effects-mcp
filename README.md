@@ -242,12 +242,14 @@ Every bridge command runs between `app.beginSuppressDialogs()` and `app.endSuppr
 
 ## Asynchronous rendering (aerender)
 
-`app.project.renderQueue.render()` blocks the After Effects UI thread, so the bridge cannot answer while it runs. For long renders use the `render-comp` and `render-status` tools, which run `aerender` as a separate process (no shell). Both are gated by `AE_MCP_ALLOW_SCRIPTS=1`.
+`app.project.renderQueue.render()` blocks the After Effects UI thread, so the bridge cannot answer while it runs. For long renders use the `render-comp`, `render-status` and `list-render-jobs` tools, which run `aerender` as a separate, detached process (no shell). `render-comp` and `list-render-jobs` are gated by `AE_MCP_ALLOW_SCRIPTS=1`; `render-status` is read-only.
 
 - `render-comp`: `projectPath`, `compName`, `outputPath`, optional `renderSettingsTemplate` and `outputModuleTemplate`. Returns a `jobId`. **Save the project first**: aerender renders the `.aep` file on disk, not the unsaved state in the open AE session.
-- `render-status`: `jobId`. Returns `state` (`running`, `done`, `error`), `exitCode`, `framesRendered`, `lastLine`, `elapsedSeconds`, `outputPath` and the last ~20 log lines.
+- `render-status`: `jobId`. Returns `state` (`running`, `done`, `error`, `unknown`), `exitCode`, `framesRendered`, `lastLine`, `elapsedSeconds`, `outputPath`, `logPath` and the last ~20 log lines. Works across server restarts.
+- `list-render-jobs`: optional `limit` (default 20). Compact status of the most recent jobs on disk, newest first; records older than 7 days are pruned.
 - aerender is auto-detected under `C:\Program Files\Adobe\Adobe After Effects <2021-2026>\Support Files\aerender.exe` (Windows) or `/Applications/Adobe After Effects <year>/aerender` (macOS). Set `AE_RENDER_EXE` to override.
-- Jobs are kept in memory only; they are lost when the server restarts.
+- Persistence: each job is a record `<bridge dir>/render-jobs/<jobId>.json` plus a log `<bridge dir>/render-jobs/<jobId>.log` (aerender stdout and stderr). Status reads only the last 64 KB of the log.
+- aerender is spawned detached, so a render keeps running if the MCP server stops or restarts. If the exit code could not be recorded (server was down when it finished), the state is inferred from process liveness and the log (`Total Time Elapsed` / `Finished composition` means `done`, a line starting with `aerender ERROR`, `ERROR:` or `Error:` means `error`, otherwise `unknown`).
 
 ## Bridge folder location
 
