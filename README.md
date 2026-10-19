@@ -216,6 +216,34 @@ You can animate layers with:
 | `deleteLayer`               | Delete a layer                        |
 | `setLayerMask`              | Create/modify layer masks             |
 
+## Running arbitrary ExtendScript (opt-in)
+
+The `run-extendscript` tool runs JavaScript (ExtendScript) inside After Effects and returns its result in a single call. Each request carries a unique command id, so the result you get back always belongs to your call.
+
+It is **disabled by default**. Enable it by starting the server with `AE_MCP_ALLOW_SCRIPTS=1`:
+
+```json
+{
+  "mcpServers": {
+    "AfterEffectsMCP": {
+      "command": "node",
+      "args": ["/path/to/after-effects-mcp/build/index.js"],
+      "env": { "AE_MCP_ALLOW_SCRIPTS": "1" }
+    }
+  }
+}
+```
+
+Parameters: `code` (a function body; use `return` to send a value back) and optional `timeoutMs` (default 60000, max 600000). The code runs inside a single undo group. Example: `return app.version;`.
+
+After Effects must have **Preferences > Scripting & Expressions > "Allow Scripts to Write Files and Access Network"** enabled, and the "MCP Bridge Auto" panel open with Auto-run on.
+
+## Bridge folder (OneDrive)
+
+The server and the After Effects panel exchange `ae_command.json` / `ae_mcp_result.json` through a shared folder. By default both use the Windows Documents folder + `ae-mcp-bridge`; the server asks Windows for the real Documents path, so OneDrive-redirected Documents (`C:\Users\<you>\OneDrive\Documents`) work. Elsewhere it falls back to `~/Documents/ae-mcp-bridge`.
+
+To use a custom folder, set `AE_MCP_BRIDGE_DIR` for **both** the MCP server and After Effects (the panel reads it with `$.getenv`, so it must be in the environment AE is launched from).
+
 ## 👨‍💻 For Developers
 
 ### 🧩 Project Structure

@@ -1317,24 +1317,59 @@ autoRunCheckbox.value = true;
 var checkInterval = 2000;
 var isChecking = false;
 
-// Command file path - use Documents folder for reliable access
-function getCommandFilePath() {
-    var userFolder = Folder.myDocuments;
-    var bridgeFolder = new Folder(userFolder.fsName + "/ae-mcp-bridge");
+// Bridge folder: AE_MCP_BRIDGE_DIR env override, else Documents/ae-mcp-bridge
+function getBridgeFolder() {
+    var override = "";
+    try { override = $.getenv("AE_MCP_BRIDGE_DIR") || ""; } catch (envErr) { override = ""; }
+    var bridgeFolder;
+    if (override && override.length > 0) {
+        bridgeFolder = new Folder(override);
+    } else {
+        bridgeFolder = new Folder(Folder.myDocuments.fsName + "/ae-mcp-bridge");
+    }
     if (!bridgeFolder.exists) {
         bridgeFolder.create();
     }
-    return bridgeFolder.fsName + "/ae_command.json";
+    return bridgeFolder;
 }
 
-// Result file path - use Documents folder for reliable access
+// Command file path
+function getCommandFilePath() {
+    return getBridgeFolder().fsName + "/ae_command.json";
+}
+
+// Result file path
 function getResultFilePath() {
-    var userFolder = Folder.myDocuments;
-    var bridgeFolder = new Folder(userFolder.fsName + "/ae-mcp-bridge");
-    if (!bridgeFolder.exists) {
-        bridgeFolder.create();
+    return getBridgeFolder().fsName + "/ae_mcp_result.json";
+}
+
+// --- runExtendScript: execute arbitrary code (function body) and return its value ---
+function toJsonSafe(value) {
+    if (value === undefined || value === null) return null;
+    var t = typeof value;
+    if (t === "string" || t === "number" || t === "boolean") return value;
+    try {
+        return JSON.parse(JSON.stringify(value));
+    } catch (e) {
+        return String(value);
     }
-    return bridgeFolder.fsName + "/ae_mcp_result.json";
+}
+
+function runExtendScript(args) {
+    var undoOpen = false;
+    try {
+        app.beginUndoGroup("MCP runExtendScript");
+        undoOpen = true;
+        var fn = new Function(args.code);
+        var value = fn();
+        return JSON.stringify({ status: "success", result: toJsonSafe(value) });
+    } catch (e) {
+        return JSON.stringify({ status: "error", message: e.toString(), line: e.line });
+    } finally {
+        if (undoOpen) {
+            try { app.endUndoGroup(); } catch (ue) {}
+        }
+    }
 }
 
 // --- setCompositionProperties: set duration, frameRate, etc. on active or named comp ---
@@ -1495,7 +1530,7 @@ function getLayerInfo() {
 }
 
 // Execute command
-function executeCommand(command, args) {
+function executeCommand(command, args, commandId) {
     var result = "";
 
     logToPanel("Executing command: " + command);
@@ -1595,6 +1630,9 @@ function executeCommand(command, args) {
                 result = setLayerMask(args);
                 logToPanel("Returned from setLayerMask.");
                 break;
+            case "runExtendScript":
+                result = runExtendScript(args);
+                break;
             default:
                 result = JSON.stringify({ error: "Unknown command: " + command });
         }
@@ -1610,6 +1648,7 @@ function executeCommand(command, args) {
             // Add a timestamp to help identify if we're getting fresh results
             resultObj._responseTimestamp = new Date().toISOString();
             resultObj._commandExecuted = command;
+            if (commandId) resultObj._commandId = commandId;
             resultString = JSON.stringify(resultObj, null, 2);
             logToPanel("Added timestamp to result JSON for tracking freshness.");
         } catch (parseError) {
@@ -1661,7 +1700,8 @@ function executeCommand(command, args) {
                 command: command,
                 message: error.toString(),
                 line: error.line,
-                fileName: error.fileName
+                fileName: error.fileName,
+                _commandId: commandId || null
             });
             var errorFile = new File(getResultFilePath());
             errorFile.encoding = "UTF-8";
@@ -1736,7 +1776,7 @@ function checkForCommands() {
                     updateCommandStatus("running");
                     
                     // Execute the command
-                    executeCommand(commandData.command, commandData.args || {});
+                    executeCommand(commandData.command, commandData.args || {}, commandData.commandId);
                 }
             }
         }

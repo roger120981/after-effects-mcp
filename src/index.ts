@@ -6,6 +6,13 @@ import * as os from "os";
 import * as path from "path";
 import { z } from "zod";
 import { fileURLToPath } from 'url';
+import {
+  buildCommand,
+  clampTimeout,
+  createCommandId,
+  resolveBridgeDir,
+  waitForCommandResult,
+} from "./bridge-protocol.js";
 
 // Create an MCP server
 const server = new McpServer({
@@ -21,16 +28,38 @@ const __dirname = path.dirname(__filename);
 const SCRIPTS_DIR = path.join(__dirname, "scripts");
 const TEMP_DIR = path.join(__dirname, "temp");
 
-// Get the correct directory for AE bridge files
-// Use ~/Documents/ae-mcp-bridge for reliable cross-process access
-function getAETempDir(): string {
-  const homeDir = os.homedir();
-  const bridgeDir = path.join(homeDir, 'Documents', 'ae-mcp-bridge');
-  // Ensure the directory exists
-  if (!fs.existsSync(bridgeDir)) {
-    fs.mkdirSync(bridgeDir, { recursive: true });
+// Ask Windows for the real Documents folder (handles OneDrive redirection),
+// which is the same location AE reports as Folder.myDocuments.
+function queryWindowsDocuments(): string | undefined {
+  try {
+    const out = execSync(
+      `powershell -NoProfile -Command "[Environment]::GetFolderPath('MyDocuments')"`,
+      { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "ignore"] }
+    ).trim();
+    return out || undefined;
+  } catch {
+    return undefined;
   }
-  return bridgeDir;
+}
+
+let cachedBridgeDir: string | undefined;
+
+// Get the directory for AE bridge files. Resolution order:
+// AE_MCP_BRIDGE_DIR > Windows known-folder Documents > ~/Documents
+function getAETempDir(): string {
+  if (!cachedBridgeDir) {
+    cachedBridgeDir = resolveBridgeDir({
+      env: process.env,
+      platform: process.platform,
+      homedir: os.homedir(),
+      queryWindowsDocuments,
+    });
+  }
+  // Ensure the directory exists
+  if (!fs.existsSync(cachedBridgeDir)) {
+    fs.mkdirSync(cachedBridgeDir, { recursive: true });
+  }
+  return cachedBridgeDir;
 }
 
 // Headless CLI execution has been removed. All interactions are routed through the Bridge panel.
@@ -105,15 +134,10 @@ async function waitForBridgeResult(expectedCommand?: string, timeoutMs: number =
 }
 
 // Helper function to write command to file
-function writeCommandFile(command: string, args: Record<string, any> = {}): void {
+function writeCommandFile(command: string, args: Record<string, any> = {}, commandId: string = createCommandId()): void {
   try {
     const commandFile = path.join(getAETempDir(), 'ae_command.json');
-    const commandData = {
-      command,
-      args,
-      timestamp: new Date().toISOString(),
-      status: "pending"  // pending, running, completed, error
-    };
+    const commandData = buildCommand(command, args, commandId);
     fs.writeFileSync(commandFile, JSON.stringify(commandData, null, 2));
     console.error(`Command "${command}" written to ${commandFile}`);
   } catch (error) {
@@ -318,6 +342,47 @@ server.prompt(
   }
 );
 
+// Opt-in tool: run arbitrary ExtendScript and wait for its own result
+server.tool(
+  "run-extendscript",
+  "Run arbitrary ExtendScript (JavaScript) code inside After Effects and return its result. The code is a function body; use `return` to produce a value. Disabled unless AE_MCP_ALLOW_SCRIPTS=1 is set for the server.",
+  {
+    code: z.string().describe("ExtendScript function body to execute inside After Effects (use return to send back a value)"),
+    timeoutMs: z.number().optional().describe("Max time to wait for the result in ms (default 60000, max 600000)")
+  },
+  async ({ code, timeoutMs }) => {
+    if (process.env.AE_MCP_ALLOW_SCRIPTS !== '1') {
+      return {
+        content: [{
+          type: "text",
+          text: "run-extendscript is disabled. It executes arbitrary code inside After Effects. To enable it, start the MCP server with the environment variable AE_MCP_ALLOW_SCRIPTS=1 and restart the client."
+        }]
+      };
+    }
+    const timeout = clampTimeout(timeoutMs);
+    clearResultsFile();
+    const commandId = createCommandId();
+    writeCommandFile("runExtendScript", { code }, commandId);
+    const resultPath = path.join(getAETempDir(), 'ae_mcp_result.json');
+    const outcome = await waitForCommandResult(
+      () => (fs.existsSync(resultPath) ? fs.readFileSync(resultPath, 'utf8') : undefined),
+      commandId,
+      timeout,
+      200,
+      (ms) => new Promise<void>((r) => setTimeout(r, ms))
+    );
+    if (outcome.timedOut) {
+      return {
+        content: [{
+          type: "text",
+          text: `Timed out after ${timeout} ms waiting for After Effects. Make sure the "MCP Bridge Auto" panel is open in After Effects with Auto-run enabled. Bridge folder in use: ${getAETempDir()}`
+        }]
+      };
+    }
+    return { content: [{ type: "text", text: JSON.stringify(outcome.parsed, null, 2) }] };
+  }
+);
+
 // Add a tool to provide help and instructions
 server.tool(
   "get-help",
@@ -377,6 +442,14 @@ Effect Templates:
 - drop-shadow: Add a customizable drop shadow
 - cinematic-look: Combination of effects for a cinematic appearance
 - text-pop: Effects to make text stand out (glow and shadow)
+
+Arbitrary ExtendScript (opt-in):
+- run-extendscript: run JavaScript inside After Effects and get its return value back in one call.
+  Disabled unless the server is started with AE_MCP_ALLOW_SCRIPTS=1.
+  The code is a function body: use \`return\` to send a value back.
+- AE_MCP_BRIDGE_DIR overrides the bridge folder (set it for both the server and After Effects).
+  By default the server and AE both use the Windows Documents folder (OneDrive-aware) / ae-mcp-bridge.
+- AE needs Preferences > Scripting & Expressions > "Allow Scripts to Write Files and Access Network".
 
 Note: The auto-running panel can be left open in After Effects to continuously listen for commands from external applications.`
         }
